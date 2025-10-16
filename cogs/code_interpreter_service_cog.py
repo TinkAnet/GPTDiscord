@@ -15,8 +15,7 @@ import aiofiles
 import discord
 import openai
 from discord.ext import pages
-from e2b import DataAnalysis
-from e2b.templates.data_analysis import Artifact
+from e2b import Sandbox
 
 from langchain.agents import (
     Tool,
@@ -69,7 +68,8 @@ GOOGLE_API_KEY = EnvService.get_google_search_api_key()
 GOOGLE_SEARCH_ENGINE_ID = EnvService.get_google_search_engine_id()
 
 E2B_API_KEY = EnvService.get_e2b_api_key()
-
+if E2B_API_KEY:
+    os.environ["E2B_API_KEY"] = E2B_API_KEY
 
 class CodeInterpreterService(discord.Cog, name="CodeInterpreterService"):
     """Cog containing translation commands and retrieval of translation services"""
@@ -302,7 +302,7 @@ class CodeInterpreterService(discord.Cog, name="CodeInterpreterService"):
     class SessionedCodeExecutor:
         def __init__(self):
             try:
-                self.session = DataAnalysis(api_key=E2B_API_KEY)
+                self.session = Sandbox.create()
                 self.sessioned = True
             except:
                 traceback.print_exc()
@@ -314,14 +314,43 @@ class CodeInterpreterService(discord.Cog, name="CodeInterpreterService"):
 
         async def execute_code_async(self, code: str):
             loop = asyncio.get_running_loop()
-            runner = functools.partial(self.session.run_python, code=code, timeout=30)
+            try:
+                # Write code to a file and execute it inside the sandbox
+                write_runner = functools.partial(
+                    self.session.files.write,
+                    path="/home/user/main.py",
+                    data=code,
+                )
+                await loop.run_in_executor(None, write_runner)
 
-            stdout, stderr, artifacts = await loop.run_in_executor(None, runner)
-            artifacts: List[Artifact] = list(artifacts)
+                run_runner = functools.partial(
+                    self.session.commands.run,
+                    cmd="python /home/user/main.py",
+                    timeout=30,
+                )
+                result = await loop.run_in_executor(None, run_runner)
+                stdout = result.stdout or ""
+                stderr = result.stderr or ""
+            except Exception as e:
+                stdout = ""
+                stderr = f"{e}"
+
+            # Discover artifacts written by the user to /home/user/artifacts
+            artifact_names: List[str] = []
+            try:
+                list_runner = functools.partial(
+                    self.session.files.list,
+                    path="/home/user/artifacts",
+                    depth=1,
+                )
+                entries = await loop.run_in_executor(None, list_runner)
+                artifact_names = [f"/home/user/artifacts/{e.name}" for e in entries]
+            except Exception:
+                artifact_names = []
 
             artifacts_or_no_artifacts = (
-                "\nArtifacts: " + str([artifact.name for artifact in artifacts])
-                if len(artifacts) > 0
+                "\nArtifacts: " + str(artifact_names)
+                if len(artifact_names) > 0
                 else "\nNO__ARTIFACTS"
             )
 
@@ -335,33 +364,48 @@ class CodeInterpreterService(discord.Cog, name="CodeInterpreterService"):
             self.session.close()
 
         def get_hostname(self):
-            return self.session.get_hostname()
+            try:
+                return f"{self.session.sandbox_id}.{self.session.sandbox_domain}"
+            except Exception:
+                return ""
 
         def download_file(self, filepath):
-            return self.session.download_file(filepath, timeout=30)
+            return self.session.files.read(filepath, format="bytes")
 
         def install_python_package(self, package):
-            return self.session.install_python_packages(package_names=package)
+            result = self.session.commands.run(
+                cmd=f"pip install {package}",
+                user="root",
+                timeout=120,
+            )
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
 
         def install_system_package(self, package):
-            return self.session.install_system_packages(package_names=package)
+            result = self.session.commands.run(
+                cmd=f"apt-get update && apt-get install -y {package}",
+                user="root",
+                timeout=180,
+            )
+            return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
 
         def run_command_sync(self, command):
             return asyncio.run(self.run_command_async(command))
 
         async def run_command_async(self, command):
             loop = asyncio.get_running_loop()
-            runner = functools.partial(
-                self.session.process.start, cmd=command, timeout=30
-            )
-
-            command = await loop.run_in_executor(None, runner)
-
-            runner = functools.partial(command.wait)
-            await loop.run_in_executor(None, runner)
-
-            output = "STDOUT:" + command.stdout + "\nSTDERR:" + command.stderr
-            return output
+            try:
+                run_runner = functools.partial(
+                    self.session.commands.run,
+                    cmd=command,
+                    timeout=60,
+                )
+                result = await loop.run_in_executor(None, run_runner)
+                stdout = result.stdout or ""
+                stderr = result.stderr or ""
+                output = "STDOUT:" + stdout + "\nSTDERR:" + stderr
+                return output
+            except Exception as e:
+                return "STDOUT:" + "" + "\nSTDERR:" + str(e)
 
         def is_sessioned(self):
             return self.sessioned
@@ -371,18 +415,15 @@ class CodeInterpreterService(discord.Cog, name="CodeInterpreterService"):
 
         async def upload_file_async(self, path, file):
             loop = asyncio.get_running_loop()
-            runner = functools.partial(
-                self.session.filesystem.write_bytes,
+            write_runner = functools.partial(
+                self.session.files.write,
                 path=f"/home/user/{path}",
-                content=file,
+                data=file,
             )
+            await loop.run_in_executor(None, write_runner)
 
-            await loop.run_in_executor(None, runner)
-
-            runner = functools.partial(
-                self.session.filesystem.list, path=f"/home/user/"
-            )
-            list_output = await loop.run_in_executor(None, runner)
+            list_runner = functools.partial(self.session.files.list, path=f"/home/user/")
+            list_output = await loop.run_in_executor(None, list_runner)
 
             return list_output
 
